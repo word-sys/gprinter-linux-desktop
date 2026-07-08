@@ -12,6 +12,12 @@ class TestCompilers(unittest.TestCase):
         self.assertIn(escpos_gen.TXT_BOLD_ON, data)
         self.assertIn(b"Hello\n", data)
 
+    def test_escpos_turkish_encoding(self):
+        items = [{"type": "text", "text": "Şişli şube"}]
+        data = escpos_gen.compile_receipt(items, 384)
+        self.assertIn(escpos_gen.TURKISH_INIT, data)
+        self.assertIn("Şişli şube".encode("cp1254"), data)
+
     def test_escpos_separator(self):
         items = [{"type": "separator"}]
         data = escpos_gen.compile_receipt(items, 384)

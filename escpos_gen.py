@@ -2,11 +2,16 @@ import os
 from PIL import Image, ImageOps
 
 ESC_INIT = b'\x1B\x40'
+TURKISH_INIT = b'\x1B\x40\x1C\x2E\x1B\x74\x26'
 ALIGN_LEFT = b'\x1B\x61\x00'
 ALIGN_CENTER = b'\x1B\x61\x01'
 ALIGN_RIGHT = b'\x1B\x61\x02'
 TXT_BOLD_ON = b'\x1B\x45\x01'
 TXT_BOLD_OFF = b'\x1B\x45\x00'
+
+
+def encode_text(text):
+    return str(text).encode('cp1254', errors='replace')
 
 def get_text_size_command(double_w=False, double_h=False):
     val = 0
@@ -71,7 +76,7 @@ def compile_receipt(items, target_width=384, chars_per_line=None, left_margin=0)
         chars_per_line = 48 if target_width <= 576 else 64
     c_per_line = chars_per_line
     sep = (b"-" * c_per_line) + b"\n"
-    out = bytearray(ESC_INIT)
+    out = bytearray(TURKISH_INIT)
 
     if left_margin > 0:
         nL = left_margin % 256
@@ -95,7 +100,7 @@ def compile_receipt(items, target_width=384, chars_per_line=None, left_margin=0)
                 out.extend(ALIGN_LEFT)
                 out.extend(TXT_BOLD_ON if bold else TXT_BOLD_OFF)
                 out.extend(get_text_size_command(dw, dh))
-                out.extend(line_str.encode('utf-8') + b"\n")
+                out.extend(encode_text(line_str) + b"\n")
             else:
                 if align == "center":
                     out.extend(ALIGN_CENTER)
@@ -105,7 +110,7 @@ def compile_receipt(items, target_width=384, chars_per_line=None, left_margin=0)
                     out.extend(ALIGN_LEFT)
                 out.extend(TXT_BOLD_ON if bold else TXT_BOLD_OFF)
                 out.extend(get_text_size_command(dw, dh))
-                out.extend(text.encode('utf-8') + b"\n")
+                out.extend(encode_text(text) + b"\n")
         elif itype == "separator":
             out.extend(ALIGN_LEFT)
             out.extend(TXT_BOLD_OFF)
