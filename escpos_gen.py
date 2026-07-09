@@ -139,3 +139,142 @@ def compile_receipt(items, target_width=384, chars_per_line=None, left_margin=0)
             out.extend(get_feed_command(lines))
             
     return bytes(out)
+
+def parse_receipt(data):
+    items = []
+    i = 0
+    align = "left"
+    bold = False
+    double_width = False
+    double_height = False
+    
+    accumulated_text = bytearray()
+    
+    def flush_text():
+        nonlocal accumulated_text
+        if accumulated_text:
+            try:
+                text_str = accumulated_text.decode('cp1254', errors='replace')
+            except Exception:
+                text_str = accumulated_text.decode('utf-8', errors='replace')
+            accumulated_text = bytearray()
+            
+            lines = text_str.split('\n')
+            for idx, line in enumerate(lines):
+                if idx == len(lines) - 1 and not line:
+                    break
+                line_stripped = line.strip()
+                if line_stripped and all(c == '-' for c in line_stripped) and len(line_stripped) >= 16:
+                    items.append({"type": "separator"})
+                else:
+                    if "   " in line:
+                        parts = [p.strip() for p in line.split("   ") if p.strip()]
+                        if len(parts) == 2:
+                            items.append({
+                                "type": "text",
+                                "text": parts[0],
+                                "right_text": parts[1],
+                                "align": "left",
+                                "bold": bold,
+                                "double_width": double_width,
+                                "double_height": double_height
+                            })
+                            continue
+                    
+                    items.append({
+                        "type": "text",
+                        "text": line,
+                        "align": align,
+                        "bold": bold,
+                        "double_width": double_width,
+                        "double_height": double_height
+                    })
+
+    while i < len(data):
+        if data[i:i+2] == b'\x1B\x40':  
+            flush_text()
+            bold = False
+            double_width = False
+            double_height = False
+            align = "left"
+            i += 2
+        elif data[i:i+3] == b'\x1B\x61\x00':  
+            flush_text()
+            align = "left"
+            i += 3
+        elif data[i:i+3] == b'\x1B\x61\x01':  
+            flush_text()
+            align = "center"
+            i += 3
+        elif data[i:i+3] == b'\x1B\x61\x02':  
+            flush_text()
+            align = "right"
+            i += 3
+        elif data[i:i+3] == b'\x1B\x45\x01':  
+            flush_text()
+            bold = True
+            i += 3
+        elif data[i:i+3] == b'\x1B\x45\x00':  
+            flush_text()
+            bold = False
+            i += 3
+        elif data[i:i+2] == b'\x1D\x21' and i + 2 < len(data):  
+            flush_text()
+            val = data[i+2]
+            double_width = bool(val & 0x10)
+            double_height = bool(val & 0x01)
+            i += 3
+        elif data[i:i+2] == b'\x1B\x64' and i + 2 < len(data):  
+            flush_text()
+            lines = data[i+2]
+            items.append({"type": "feed", "lines": lines})
+            i += 3
+        elif data[i:i+2] == b'\x1D\x56' and i + 2 < len(data): 
+            flush_text()
+            m = data[i+2]
+            if m in (0, 1, 48, 49):
+                i += 3
+            elif m in (65, 66) and i + 3 < len(data):
+                i += 4
+            else:
+                i += 3
+            items.append({"type": "cut"})
+        elif data[i:i+4] == b'\x1D\x76\x30\x00' and i + 8 < len(data):  
+            flush_text()
+            width_bytes = data[i+4] + data[i+5] * 256
+            height = data[i+6] + data[i+7] * 256
+            pixel_bytes_len = width_bytes * height
+            pixel_data = data[i+8 : i+8+pixel_bytes_len]
+            
+            try:
+                img = Image.new('1', (width_bytes * 8, height), 1)
+                for y in range(height):
+                    for xb in range(width_bytes):
+                        idx = y * width_bytes + xb
+                        if idx < len(pixel_data):
+                            b_val = pixel_data[idx]
+                            for bit in range(8):
+                                px_x = xb * 8 + bit
+                                if (b_val & (1 << (7 - bit))) != 0:
+                                    img.putpixel((px_x, y), 0)
+                items.append({
+                    "type": "image",
+                    "image": img,
+                    "align": align,
+                    "invert": False,
+                    "keep_aspect": True
+                })
+            except Exception as e:
+                print(f"Error parsing image: {e}")
+            i += 8 + pixel_bytes_len
+        elif data[i:i+3] == b'\x1C\x2E\x1B':  
+            i += 1
+        elif data[i:i+2] == b'\x1B\x74':  
+            i += 3
+        else:
+            accumulated_text.append(data[i])
+            i += 1
+            
+    flush_text()
+    return items
+

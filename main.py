@@ -3,8 +3,11 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib
 
 import os
+import threading
+import time
+import socket
+import fitz  # PyMuPDF
 from PIL import Image
-import fitz
 
 import printer_comm
 import escpos_gen
@@ -44,6 +47,9 @@ css_provider.load_from_data(b"""
         border-radius: 6px;
         padding: 8px;
     }
+    .status-panel {
+        font-size: 11px;
+    }
 """)
 Gtk.StyleContext.add_provider_for_screen(
     Gdk.Screen.get_default(),
@@ -53,8 +59,8 @@ Gtk.StyleContext.add_provider_for_screen(
 
 class GPrinterApp(Gtk.Window):
     def __init__(self):
-        super().__init__(title="GPrinter Linuz Desktop Printer")
-        self.set_default_size(1024, 768)
+        super().__init__(title="GPrinter Linux Desktop Printer")
+        self.set_default_size(1050, 780)
         
         self.current_pdf_doc = None
         self.current_pdf_page = 0
@@ -81,7 +87,37 @@ class GPrinterApp(Gtk.Window):
         self.chars_per_line = 48
         self.left_margin = 24
         
+        self.orders = [
+            {
+                "id": "ORD-100234",
+                "customer": "John Doe",
+                "date": "2026-07-09 09:15:00",
+                "status": "Pending",
+                "items": [
+                    {"name": "Double Espresso", "qty": 2, "price": 2.50},
+                    {"name": "Caramel Latte", "qty": 1, "price": 4.50},
+                    {"name": "Butter Croissant", "qty": 1, "price": 3.00}
+                ]
+            },
+            {
+                "id": "ORD-100235",
+                "customer": "Jane Smith",
+                "date": "2026-07-09 09:18:00",
+                "status": "Pending",
+                "items": [
+                    {"name": "Iced Matcha Latte", "qty": 1, "price": 5.00},
+                    {"name": "Blueberry Muffin", "qty": 2, "price": 3.50}
+                ]
+            }
+        ]
+        
+        self.pdf_queue = []
+        
+        self.status_polling_active = True
+        
         self.init_ui()
+        self.start_status_polling()
+        self.update_previews()
 
     def init_ui(self):
         self.set_title("GPrinter Linux Desktop Printer")
@@ -101,17 +137,18 @@ class GPrinterApp(Gtk.Window):
         title_lbl = Gtk.Label()
         title_lbl.set_markup("<span weight='bold' size='large'>GPrinter Linux Desktop Printer</span>")
         title_lbl.set_xalign(0.0)
-        subtitle_lbl = Gtk.Label(label="Linux v0.1")
+        subtitle_lbl = Gtk.Label(label="Ethernet & Order Printing v1.0")
         subtitle_lbl.set_xalign(0.0)
         subtitle_lbl.get_style_context().add_class("dim-label")
         title_box.pack_start(title_lbl, False, False, 0)
         title_box.pack_start(subtitle_lbl, False, False, 0)
         top_bar.pack_start(title_box, False, False, 0)
         
-        self.status_label = Gtk.Label(label="Idle")
+        self.status_label = Gtk.Label()
+        self.status_label.set_markup("<span foreground='orange' weight='bold'>Initializing...</span>")
         top_bar.pack_start(self.status_label, True, True, 0)
         
-        print_btn = Gtk.Button(label="Print")
+        print_btn = Gtk.Button(label="Print Current View")
         print_btn.get_style_context().add_class("suggested-action")
         print_btn.connect("clicked", self.on_print_clicked)
         top_bar.pack_end(print_btn, False, False, 0)
@@ -129,17 +166,49 @@ class GPrinterApp(Gtk.Window):
         conn_grid = Gtk.Grid(row_spacing=6, column_spacing=6)
         conn_frame.add(conn_grid)
         
-        conn_grid.attach(Gtk.Label(label="Device Path:"), 0, 0, 1, 1)
-        self.dev_path_entry = Gtk.Entry(text="/dev/usb/lp0")
-        conn_grid.attach(self.dev_path_entry, 1, 0, 1, 1)
+        conn_grid.attach(Gtk.Label(label="Mode:"), 0, 0, 1, 1)
+        self.conn_combo = Gtk.ComboBoxText()
+        self.conn_combo.append("usb", "USB (/dev/usb/lp*)")
+        self.conn_combo.append("ethernet", "Ethernet (LAN)")
+        self.conn_combo.set_active_id("usb")
+        self.conn_combo.connect("changed", self.on_conn_mode_changed)
+        conn_grid.attach(self.conn_combo, 1, 0, 1, 1)
         
-        detect_btn = Gtk.Button(label="Auto-Detect")
-        detect_btn.connect("clicked", self.on_detect_clicked)
-        conn_grid.attach(detect_btn, 0, 1, 1, 1)
+        self.usb_lbl = Gtk.Label(label="Device Path:")
+        conn_grid.attach(self.usb_lbl, 0, 1, 1, 1)
+        self.dev_path_entry = Gtk.Entry(text="/dev/usb/lp0")
+        conn_grid.attach(self.dev_path_entry, 1, 1, 1, 1)
+        
+        self.usb_detect_btn = Gtk.Button(label="Auto-Detect")
+        self.usb_detect_btn.connect("clicked", self.on_detect_clicked)
+        conn_grid.attach(self.usb_detect_btn, 1, 2, 1, 1)
+        
+        self.ip_lbl = Gtk.Label(label="IP Address:")
+        conn_grid.attach(self.ip_lbl, 0, 3, 1, 1)
+        self.ip_entry = Gtk.Entry(text="192.168.1.100")
+        conn_grid.attach(self.ip_entry, 1, 3, 1, 1)
+        
+        self.print_port_lbl = Gtk.Label(label="Print Port:")
+        conn_grid.attach(self.print_port_lbl, 0, 4, 1, 1)
+        self.print_port_spin = Gtk.SpinButton(adjustment=Gtk.Adjustment(value=9100, lower=1, upper=65535, step_increment=1))
+        conn_grid.attach(self.print_port_spin, 1, 4, 1, 1)
+        
+        self.status_port_lbl = Gtk.Label(label="Status Port:")
+        conn_grid.attach(self.status_port_lbl, 0, 5, 1, 1)
+        self.status_port_spin = Gtk.SpinButton(adjustment=Gtk.Adjustment(value=4000, lower=1, upper=65535, step_increment=1))
+        conn_grid.attach(self.status_port_spin, 1, 5, 1, 1)
+        
+        self.scan_lan_btn = Gtk.Button(label="Scan LAN")
+        self.scan_lan_btn.connect("clicked", self.on_scan_lan_clicked)
+        conn_grid.attach(self.scan_lan_btn, 0, 6, 1, 1)
+        
+        self.discovered_combo = Gtk.ComboBoxText()
+        self.discovered_combo.connect("changed", self.on_discovered_changed)
+        conn_grid.attach(self.discovered_combo, 1, 6, 1, 1)
         
         test_btn = Gtk.Button(label="Test Connection")
         test_btn.connect("clicked", self.on_test_clicked)
-        conn_grid.attach(test_btn, 1, 1, 1, 1)
+        conn_grid.attach(test_btn, 0, 7, 2, 1)
         
         config_frame = Gtk.Frame(label="General Print Settings")
         sidebar.pack_start(config_frame, False, False, 0)
@@ -170,14 +239,398 @@ class GPrinterApp(Gtk.Window):
         self.margin_spin.connect("value-changed", self.on_left_margin_changed)
         config_grid.attach(self.margin_spin, 1, 2, 1, 1)
         
+        self.autocut_chk = Gtk.CheckButton(label="Auto-Cut Paper after print")
+        self.autocut_chk.set_active(True)
+        config_grid.attach(self.autocut_chk, 0, 3, 2, 1)
+        
+        self.on_conn_mode_changed(self.conn_combo)
+        
         self.notebook = Gtk.Notebook()
         main_hbox.pack_start(self.notebook, True, True, 6)
         
+        self.setup_order_tab()
         self.setup_receipt_tab()
         self.setup_label_tab()
         self.setup_pdf_tab()
+
+    def on_conn_mode_changed(self, widget):
+        mode = widget.get_active_id()
+        is_usb = (mode == "usb")
         
-        self.update_previews()
+        self.usb_lbl.set_visible(is_usb)
+        self.dev_path_entry.set_visible(is_usb)
+        self.usb_detect_btn.set_visible(is_usb)
+        self.ip_lbl.set_visible(not is_usb)
+        self.ip_entry.set_visible(not is_usb)
+        self.print_port_lbl.set_visible(not is_usb)
+        self.print_port_spin.set_visible(not is_usb)
+        self.status_port_lbl.set_visible(not is_usb)
+        self.status_port_spin.set_visible(not is_usb)
+        self.scan_lan_btn.set_visible(not is_usb)
+        self.discovered_combo.set_visible(not is_usb)
+
+    def start_status_polling(self):
+        GLib.timeout_add(1500, self.poll_printer_status)
+
+    def poll_printer_status(self):
+        if not self.status_polling_active:
+            return True
+            
+        mode = self.conn_combo.get_active_id()
+        if mode == "usb":
+            path = self.dev_path_entry.get_text()
+            if os.path.exists(path):
+                self.status_label.set_markup("<span foreground='#2e7d32' weight='bold'>Connected (USB)</span>")
+            else:
+                self.status_label.set_markup("<span foreground='#c62828' weight='bold'>Disconnected (USB)</span>")
+        else:
+            ip = self.ip_entry.get_text()
+            try:
+                status_port = int(self.status_port_spin.get_value())
+            except Exception:
+                status_port = 4000
+                
+            def run_query():
+                status = printer_comm.query_ethernet_status(ip, status_port)
+                GLib.idle_add(self.update_ethernet_status_ui, status)
+                
+            threading.Thread(target=run_query, daemon=True).start()
+            
+        return True
+
+    def update_ethernet_status_ui(self, status):
+        if not status["success"]:
+            self.status_label.set_markup(f"<span foreground='#c62828' weight='bold'>Offline: {status['error_msg']}</span>")
+        else:
+            msg = status["error_msg"]
+            if msg == "Ready":
+                self.status_label.set_markup(f"<span foreground='#2e7d32' weight='bold'>Printer Ready ({self.ip_entry.get_text()})</span>")
+            else:
+                self.status_label.set_markup(f"<span foreground='#ef6c00' weight='bold'>Printer Alert: {msg}</span>")
+
+    def on_scan_lan_clicked(self, widget):
+        self.status_label.set_text("Scanning LAN subnets...")
+        widget.set_sensitive(False)
+        
+        def run_scan():
+            printers = printer_comm.scan_lan_printers()
+            GLib.idle_add(self.update_discovered_printers, printers, widget)
+            
+        threading.Thread(target=run_scan, daemon=True).start()
+
+    def update_discovered_printers(self, printers, button):
+        button.set_sensitive(True)
+        self.discovered_combo.clear()
+        
+        if not printers:
+            self.status_label.set_text("No LAN printers found")
+            self.show_info_dialog("No printers discovered on local network.")
+            return
+            
+        self.status_label.set_text(f"Scan complete: found {len(printers)} printers")
+        for ip, model in printers:
+            self.discovered_combo.append(ip, f"{model} ({ip})")
+        self.discovered_combo.set_active(0)
+
+    def on_discovered_changed(self, widget):
+        ip = widget.get_active_id()
+        if ip:
+            self.ip_entry.set_text(ip)
+
+    def setup_order_tab(self):
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        hbox.set_margin_bottom(10)
+        hbox.set_margin_start(10)
+        hbox.set_margin_end(10)
+        
+        self.notebook.append_page(hbox, Gtk.Label(label="Order List"))
+        
+        left_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left_box.set_size_request(350, -1)
+        left_box.set_margin_top(36)
+        hbox.pack_start(left_box, False, False, 6)
+        
+        scroll = Gtk.ScrolledWindow()
+        left_box.pack_start(scroll, True, True, 0)
+        
+        self.order_model = Gtk.ListStore(str, str, str, str, int)
+        self.order_tree = Gtk.TreeView(model=self.order_model)
+        self.order_tree.connect("cursor-changed", self.on_order_selected)
+        scroll.add(self.order_tree)
+        
+        self.order_tree.append_column(Gtk.TreeViewColumn("Order ID", Gtk.CellRendererText(), text=0))
+        self.order_tree.append_column(Gtk.TreeViewColumn("Customer", Gtk.CellRendererText(), text=1))
+        self.order_tree.append_column(Gtk.TreeViewColumn("Total", Gtk.CellRendererText(), text=2))
+        self.order_tree.append_column(Gtk.TreeViewColumn("Status", Gtk.CellRendererText(), text=3))
+        
+        self.populate_order_model()
+        
+        btn_box = Gtk.Grid(row_spacing=4, column_spacing=4)
+        left_box.pack_start(btn_box, False, False, 0)
+        
+        add_btn = Gtk.Button(label="Add Order")
+        add_btn.connect("clicked", self.on_add_order_clicked)
+        btn_box.attach(add_btn, 0, 0, 1, 1)
+        
+        edit_btn = Gtk.Button(label="Edit Order")
+        edit_btn.connect("clicked", self.on_edit_order_clicked)
+        btn_box.attach(edit_btn, 1, 0, 1, 1)
+        
+        del_btn = Gtk.Button(label="Delete Order")
+        del_btn.get_style_context().add_class("destructive-action")
+        del_btn.connect("clicked", self.on_del_order_clicked)
+        btn_box.attach(del_btn, 2, 0, 1, 1)
+        
+        print_order_btn = Gtk.Button(label="Print Selected Order")
+        print_order_btn.get_style_context().add_class("suggested-action")
+        print_order_btn.connect("clicked", self.on_print_order_clicked)
+        btn_box.attach(print_order_btn, 0, 1, 3, 1)
+        
+        right_scroll = Gtk.ScrolledWindow()
+        right_scroll.set_margin_top(36)
+        hbox.pack_start(right_scroll, True, True, 6)
+        
+        self.order_preview = PrinterPreviewCanvas()
+        right_scroll.add(self.order_preview)
+
+    def populate_order_model(self):
+        self.order_model.clear()
+        for idx, order in enumerate(self.orders):
+            subtotal = sum(it["qty"] * it["price"] for it in order["items"])
+            total = subtotal * 1.08
+            self.order_model.append([
+                order["id"],
+                order["customer"],
+                f"${total:.2f}",
+                order["status"],
+                idx
+            ])
+
+    def on_order_selected(self, widget):
+        selection = self.order_tree.get_selection()
+        model, treeiter = selection.get_selected()
+        if not treeiter:
+            return
+        idx = model.get_value(treeiter, 4)
+        order = self.orders[idx]
+        items = self.compile_order_to_receipt_items(order)
+        
+        w_id = self.width_combo.get_active_id()
+        tw = int(w_id) if w_id else 832
+        self.order_preview.set_receipt_items(items, tw, self.chars_per_line, self.left_margin)
+
+    def generate_mock_qrcode(self, data):
+        size = 25
+        cell = 6
+        img = Image.new('1', (size * cell, size * cell), 1)
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(img)
+        
+        def draw_finder(x, y):
+            draw.rectangle([x*cell, y*cell, (x+7)*cell - 1, (y+7)*cell - 1], fill=0)
+            draw.rectangle([(x+1)*cell, (y+1)*cell, (x+6)*cell - 1, (y+6)*cell - 1], fill=1)
+            draw.rectangle([(x+2)*cell, (y+2)*cell, (x+5)*cell - 1, (y+5)*cell - 1], fill=0)
+            
+        draw_finder(0, 0)
+        draw_finder(18, 0)
+        draw_finder(0, 18)
+        
+        import random
+        rng = random.Random(hash(data))
+        for r in range(size):
+            for c in range(size):
+                if (r < 8 and c < 8) or (r < 8 and c > 16) or (r > 16 and c < 8):
+                    continue
+                if rng.random() > 0.5:
+                    draw.rectangle([c*cell, r*cell, (c+1)*cell - 1, (r+1)*cell - 1], fill=0)
+        return img
+
+    def compile_order_to_receipt_items(self, order):
+        items = []
+        items.append({"type": "text", "text": "GPRINTER ORDER INVOICE", "align": "center", "bold": True, "double_width": True, "double_height": True})
+        items.append({"type": "text", "text": "Ethernet Print Service", "align": "center", "bold": False})
+        items.append({"type": "separator"})
+        items.append({"type": "text", "text": f"Order: {order['id']}", "align": "left", "bold": True})
+        items.append({"type": "text", "text": f"Customer: {order['customer']}", "align": "left"})
+        items.append({"type": "text", "text": f"Date: {order['date']}", "align": "left"})
+        items.append({"type": "separator"})
+        
+        subtotal = 0.0
+        for it in order["items"]:
+            name_qty = f"{it['name']} x{it['qty']}"
+            price_total = f"${(it['price'] * it['qty']):.2f}"
+            items.append({
+                "type": "text",
+                "text": name_qty,
+                "right_text": price_total,
+                "bold": False
+            })
+            subtotal += it['price'] * it['qty']
+            
+        tax = subtotal * 0.08
+        total = subtotal + tax
+        
+        items.append({"type": "separator"})
+        items.append({"type": "text", "text": "Subtotal", "right_text": f"${subtotal:.2f}"})
+        items.append({"type": "text", "text": "Tax (8%)", "right_text": f"${tax:.2f}"})
+        items.append({"type": "text", "text": "Total", "right_text": f"${total:.2f}", "bold": True, "double_height": True})
+        items.append({"type": "separator"})
+        
+        qr_img = self.generate_mock_qrcode(f"https://gprinter.com/verify/{order['id']}")
+        items.append({"type": "image", "image": qr_img, "align": "center", "keep_aspect": True, "width": 180})
+        
+        items.append({"type": "feed", "lines": 3})
+        return items
+
+    def on_add_order_clicked(self, widget):
+        dialog = Gtk.Dialog(title="Add New Order", transient_for=self, flags=0)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        
+        grid = Gtk.Grid(row_spacing=6, column_spacing=6, margin=12)
+        dialog.get_content_area().add(grid)
+        
+        grid.attach(Gtk.Label(label="Order ID:"), 0, 0, 1, 1)
+        id_entry = Gtk.Entry(text=f"ORD-{int(time.time()) % 1000000:06d}")
+        grid.attach(id_entry, 1, 0, 1, 1)
+        
+        grid.attach(Gtk.Label(label="Customer:"), 0, 1, 1, 1)
+        cust_entry = Gtk.Entry(text="John Doe")
+        grid.attach(cust_entry, 1, 1, 1, 1)
+        
+        grid.attach(Gtk.Label(label="Item Details (Name, qty, price):"), 0, 2, 2, 1)
+        
+        grid.attach(Gtk.Label(label="Item A (Qty):"), 0, 3, 1, 1)
+        qty_a = Gtk.SpinButton(adjustment=Gtk.Adjustment(value=1, lower=0, upper=10, step_increment=1))
+        grid.attach(qty_a, 1, 3, 1, 1)
+        
+        grid.attach(Gtk.Label(label="Item B (Qty):"), 0, 4, 1, 1)
+        qty_b = Gtk.SpinButton(adjustment=Gtk.Adjustment(value=0, lower=0, upper=10, step_increment=1))
+        grid.attach(qty_b, 1, 4, 1, 1)
+        
+        dialog.show_all()
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            items = []
+            if qty_a.get_value_as_int() > 0:
+                items.append({"name": "Black Coffee", "qty": qty_a.get_value_as_int(), "price": 3.00})
+            if qty_b.get_value_as_int() > 0:
+                items.append({"name": "Cheese Cake", "qty": qty_b.get_value_as_int(), "price": 4.50})
+                
+            if not items:
+                items.append({"name": "Generic Item", "qty": 1, "price": 10.00})
+                
+            new_order = {
+                "id": id_entry.get_text(),
+                "customer": cust_entry.get_text(),
+                "date": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "Pending",
+                "items": items
+            }
+            self.orders.append(new_order)
+            self.populate_order_model()
+        dialog.destroy()
+
+    def on_edit_order_clicked(self, widget):
+        selection = self.order_tree.get_selection()
+        model, treeiter = selection.get_selected()
+        if not treeiter:
+            self.show_error_dialog("No order selected.")
+            return
+        idx = model.get_value(treeiter, 4)
+        order = self.orders[idx]
+        
+        dialog = Gtk.Dialog(title="Edit Customer", transient_for=self, flags=0)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        
+        grid = Gtk.Grid(row_spacing=6, column_spacing=6, margin=12)
+        dialog.get_content_area().add(grid)
+        
+        grid.attach(Gtk.Label(label="Customer Name:"), 0, 0, 1, 1)
+        cust_entry = Gtk.Entry(text=order["customer"])
+        grid.attach(cust_entry, 1, 0, 1, 1)
+        
+        dialog.show_all()
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            order["customer"] = cust_entry.get_text()
+            self.populate_order_model()
+            self.on_order_selected(None)
+        dialog.destroy()
+
+    def on_del_order_clicked(self, widget):
+        selection = self.order_tree.get_selection()
+        model, treeiter = selection.get_selected()
+        if not treeiter:
+            return
+        idx = model.get_value(treeiter, 4)
+        del self.orders[idx]
+        self.populate_order_model()
+        self.order_preview.set_receipt_items([], 832)
+
+    def on_print_order_clicked(self, widget):
+        selection = self.order_tree.get_selection()
+        model, treeiter = selection.get_selected()
+        if not treeiter:
+            self.show_error_dialog("No order selected.")
+            return
+            
+        idx = model.get_value(treeiter, 4)
+        order = self.orders[idx]
+        
+        w_id = self.width_combo.get_active_id()
+        tw = int(w_id) if w_id else 832
+        
+        items = self.compile_order_to_receipt_items(order)
+        data = escpos_gen.compile_receipt(items, tw, self.chars_per_line, self.left_margin)
+        
+        if self.autocut_chk.get_active():
+            data += b'\x1D\x56\x42\x00'
+            
+        mode = self.conn_combo.get_active_id()
+        if mode == "usb":
+            path = self.dev_path_entry.get_text()
+            self.status_label.set_text("Printing order via USB...")
+            success, err = printer_comm.write_to_printer(path, data)
+            if success:
+                self.status_label.set_text("Print succeeded")
+                order["status"] = "Printed"
+                self.populate_order_model()
+            else:
+                self.status_label.set_text("Print failed")
+                order["status"] = "Error"
+                self.populate_order_model()
+                self.show_error_dialog(f"Printing failed: {err}")
+        else:
+            ip = self.ip_entry.get_text()
+            try:
+                status_port = int(self.status_port_spin.get_value())
+                print_port = int(self.print_port_spin.get_value())
+            except Exception:
+                status_port = 4000
+                print_port = 9100
+                
+            self.status_label.set_text("Printing LAN order (status checked)...")
+            
+            def run_print():
+                success, err = printer_comm.print_with_status_check(ip, data, status_port, print_port)
+                if success:
+                    GLib.idle_add(self.order_print_completed, order, idx, True, None)
+                else:
+                    GLib.idle_add(self.order_print_completed, order, idx, False, err)
+                    
+            threading.Thread(target=run_print, daemon=True).start()
+
+    def order_print_completed(self, order, idx, success, err):
+        if success:
+            self.status_label.set_text("Print succeeded")
+            order["status"] = "Printed"
+            self.populate_order_model()
+            self.show_info_dialog("Order printed successfully!")
+        else:
+            self.status_label.set_text("Print failed")
+            order["status"] = f"Error: {err}"
+            self.populate_order_model()
+            self.show_error_dialog(f"Printing failed:\n{err}")
 
     def setup_receipt_tab(self):
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -185,10 +638,12 @@ class GPrinterApp(Gtk.Window):
         hbox.set_margin_start(10)
         hbox.set_margin_end(10)
         self.notebook.append_page(hbox, Gtk.Label(label="ESC/POS Receipt"))
+        
         left_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         left_box.set_size_request(300, -1)
         left_box.set_margin_top(36)
         hbox.pack_start(left_box, False, False, 6)
+        
         scroll = Gtk.ScrolledWindow()
         left_box.pack_start(scroll, True, True, 0)
         
@@ -238,6 +693,14 @@ class GPrinterApp(Gtk.Window):
         move_down.connect("clicked", self.on_move_receipt_down)
         btn_box.attach(move_down, 2, 2, 2, 1)
         
+        import_btn = Gtk.Button(label="Import .bin")
+        import_btn.connect("clicked", self.on_import_receipt_bin)
+        btn_box.attach(import_btn, 0, 3, 2, 1)
+        
+        export_btn = Gtk.Button(label="Export .bin")
+        export_btn.connect("clicked", self.on_export_receipt_bin)
+        btn_box.attach(export_btn, 2, 3, 2, 1)
+        
         right_scroll = Gtk.ScrolledWindow()
         right_scroll.set_margin_top(36)
         hbox.pack_start(right_scroll, True, True, 6)
@@ -255,6 +718,54 @@ class GPrinterApp(Gtk.Window):
             elif itype == "feed":
                 details = f"{item.get('lines', 1)} lines"
             self.receipt_model.append([itype, str(details), idx])
+
+    def on_import_receipt_bin(self, widget):
+        dialog = Gtk.FileChooserDialog(title="Import Raw ESC/POS Binary", transient_for=self, action=Gtk.FileChooserAction.OPEN)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        
+        filter_bin = Gtk.FileFilter()
+        filter_bin.set_name("Binary files (*.bin)")
+        filter_bin.add_pattern("*.bin")
+        dialog.add_filter(filter_bin)
+        
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            path = dialog.get_filename()
+            if path:
+                try:
+                    with open(path, 'rb') as f:
+                        data = f.read()
+                    parsed = escpos_gen.parse_receipt(data)
+                    if parsed:
+                        self.receipt_items = parsed
+                        self.populate_receipt_model()
+                        self.update_previews()
+                    else:
+                        self.show_error_dialog("Failed to parse or empty ESC/POS binary file.")
+                except Exception as e:
+                    self.show_error_dialog(f"Import failed: {e}")
+        dialog.destroy()
+
+    def on_export_receipt_bin(self, widget):
+        dialog = Gtk.FileChooserDialog(title="Export Raw ESC/POS Binary", transient_for=self, action=Gtk.FileChooserAction.SAVE)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        dialog.set_current_name("receipt.bin")
+        
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            path = dialog.get_filename()
+            if path:
+                try:
+                    w_id = self.width_combo.get_active_id()
+                    tw = int(w_id) if w_id else 832
+                    data = escpos_gen.compile_receipt(self.receipt_items, tw, self.chars_per_line, self.left_margin)
+                    if self.autocut_chk.get_active():
+                        data += b'\x1D\x56\x42\x00'
+                    with open(path, 'wb') as f:
+                        f.write(data)
+                except Exception as e:
+                    self.show_error_dialog(f"Export failed: {e}")
+        dialog.destroy()
 
     def setup_label_tab(self):
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -337,6 +848,14 @@ class GPrinterApp(Gtk.Window):
         move_down.connect("clicked", self.on_move_label_down)
         btn_box.attach(move_down, 2, 2, 2, 1)
         
+        import_btn = Gtk.Button(label="Import .bin")
+        import_btn.connect("clicked", self.on_import_label_bin)
+        btn_box.attach(import_btn, 0, 3, 2, 1)
+        
+        export_btn = Gtk.Button(label="Export .bin")
+        export_btn.connect("clicked", self.on_export_label_bin)
+        btn_box.attach(export_btn, 2, 3, 2, 1)
+        
         right_scroll = Gtk.ScrolledWindow()
         right_scroll.set_margin_top(36)
         hbox.pack_start(right_scroll, True, True, 6)
@@ -357,6 +876,57 @@ class GPrinterApp(Gtk.Window):
                 info += str(el["image"])
             self.label_model.append([etype, info, idx])
 
+    def on_import_label_bin(self, widget):
+        dialog = Gtk.FileChooserDialog(title="Import Raw TSPL Binary", transient_for=self, action=Gtk.FileChooserAction.OPEN)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        
+        filter_bin = Gtk.FileFilter()
+        filter_bin.set_name("Binary files (*.bin)")
+        filter_bin.add_pattern("*.bin")
+        dialog.add_filter(filter_bin)
+        
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            path = dialog.get_filename()
+            if path:
+                try:
+                    with open(path, 'rb') as f:
+                        data = f.read()
+                    w_mm, h_mm, g_mm, elements = tspl_gen.parse_label(data)
+                    self.label_width_mm = w_mm
+                    self.label_height_mm = h_mm
+                    self.label_gap_mm = g_mm
+                    self.label_elements = elements
+                    
+                    self.lbl_w_entry.set_text(str(w_mm))
+                    self.lbl_h_entry.set_text(str(h_mm))
+                    self.lbl_g_entry.set_text(str(g_mm))
+                    
+                    self.populate_label_model()
+                    self.update_previews()
+                except Exception as e:
+                    self.show_error_dialog(f"Import failed: {e}")
+        dialog.destroy()
+
+    def on_export_label_bin(self, widget):
+        dialog = Gtk.FileChooserDialog(title="Export Raw TSPL Binary", transient_for=self, action=Gtk.FileChooserAction.SAVE)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        dialog.set_current_name("label.bin")
+        
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            path = dialog.get_filename()
+            if path:
+                try:
+                    data = tspl_gen.compile_label(self.label_width_mm, self.label_height_mm, self.label_gap_mm, self.label_elements)
+                    if self.autocut_chk.get_active():
+                        data += b"CUT\r\n"
+                    with open(path, 'wb') as f:
+                        f.write(data)
+                except Exception as e:
+                    self.show_error_dialog(f"Export failed: {e}")
+        dialog.destroy()
+
     def setup_pdf_tab(self):
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         hbox.set_margin_bottom(10)
@@ -365,7 +935,7 @@ class GPrinterApp(Gtk.Window):
         self.notebook.append_page(hbox, Gtk.Label(label="Quick PDF"))
         
         left_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        left_box.set_size_request(300, -1)
+        left_box.set_size_request(320, -1)
         left_box.set_margin_top(36)
         hbox.pack_start(left_box, False, False, 6)
         
@@ -390,12 +960,210 @@ class GPrinterApp(Gtk.Window):
         pdf_print_btn.connect("clicked", self.on_pdf_print_clicked)
         left_box.pack_start(pdf_print_btn, False, False, 0)
         
+        queue_frame = Gtk.Frame(label="PDF Print Queue (Multiple PDFs)")
+        left_box.pack_start(queue_frame, True, True, 0)
+        
+        q_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        queue_frame.add(q_vbox)
+        
+        q_scroll = Gtk.ScrolledWindow()
+        q_scroll.set_size_request(-1, 150)
+        q_vbox.pack_start(q_scroll, True, True, 0)
+        
+        # Cols: Filename, Range, Status, internal index
+        self.pdf_queue_model = Gtk.ListStore(str, str, str, int)
+        self.pdf_queue_tree = Gtk.TreeView(model=self.pdf_queue_model)
+        self.pdf_queue_tree.connect("cursor-changed", self.on_queue_item_selected)
+        q_scroll.add(self.pdf_queue_tree)
+        self.pdf_queue_tree.append_column(Gtk.TreeViewColumn("File Name", Gtk.CellRendererText(), text=0))
+        self.pdf_queue_tree.append_column(Gtk.TreeViewColumn("Pages", Gtk.CellRendererText(), text=1))
+        self.pdf_queue_tree.append_column(Gtk.TreeViewColumn("Status", Gtk.CellRendererText(), text=2))
+        
+        q_btn_grid = Gtk.Grid(row_spacing=2, column_spacing=2)
+        q_vbox.pack_start(q_btn_grid, False, False, 0)
+        
+        q_add_btn = Gtk.Button(label="+ Add PDF")
+        q_add_btn.connect("clicked", self.on_add_pdf_to_queue)
+        q_btn_grid.attach(q_add_btn, 0, 0, 1, 1)
+        
+        q_rem_btn = Gtk.Button(label="- Remove")
+        q_rem_btn.connect("clicked", self.on_remove_pdf_from_queue)
+        q_btn_grid.attach(q_rem_btn, 1, 0, 1, 1)
+        
+        q_clear_btn = Gtk.Button(label="Clear")
+        q_clear_btn.connect("clicked", self.on_clear_pdf_queue)
+        q_btn_grid.attach(q_clear_btn, 2, 0, 1, 1)
+        
+        q_print_btn = Gtk.Button(label="Print Queue")
+        q_print_btn.get_style_context().add_class("suggested-action")
+        q_print_btn.connect("clicked", self.on_print_pdf_queue_clicked)
+        q_btn_grid.attach(q_print_btn, 0, 1, 3, 1)
+        
         right_scroll = Gtk.ScrolledWindow()
         right_scroll.set_margin_top(36)
         hbox.pack_start(right_scroll, True, True, 6)
         
         self.pdf_preview = PrinterPreviewCanvas()
         right_scroll.add(self.pdf_preview)
+
+    def populate_pdf_queue_model(self):
+        self.pdf_queue_model.clear()
+        for idx, item in enumerate(self.pdf_queue):
+            filename = os.path.basename(item["path"])
+            self.pdf_queue_model.append([filename, item["range"], item["status"], idx])
+
+    def on_add_pdf_to_queue(self, widget):
+        dialog = Gtk.FileChooserDialog(title="Select PDF for Queue", transient_for=self, action=Gtk.FileChooserAction.OPEN)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        
+        filter_pdf = Gtk.FileFilter()
+        filter_pdf.set_name("PDF Files (*.pdf)")
+        filter_pdf.add_pattern("*.pdf")
+        dialog.add_filter(filter_pdf)
+        
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            path = dialog.get_filename()
+            dialog.destroy()
+            if path:
+                # Page Range dialog
+                range_dlg = Gtk.Dialog(title="Select Page Range", transient_for=self, flags=0)
+                range_dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
+                grid = Gtk.Grid(row_spacing=6, column_spacing=6, margin=12)
+                range_dlg.get_content_area().add(grid)
+                grid.attach(Gtk.Label(label="Range (e.g. '0-1' for 2 pages, 'All', or '0,1'):"), 0, 0, 2, 1)
+                entry = Gtk.Entry(text="0-1")
+                grid.attach(entry, 0, 1, 2, 1)
+                
+                range_dlg.show_all()
+                resp = range_dlg.run()
+                if resp == Gtk.ResponseType.OK:
+                    self.pdf_queue.append({
+                        "path": path,
+                        "range": entry.get_text(),
+                        "status": "Pending"
+                    })
+                    self.populate_pdf_queue_model()
+                range_dlg.destroy()
+        else:
+            dialog.destroy()
+
+    def on_remove_pdf_from_queue(self, widget):
+        selection = self.pdf_queue_tree.get_selection()
+        model, treeiter = selection.get_selected()
+        if not treeiter:
+            return
+        idx = model.get_value(treeiter, 3)
+        del self.pdf_queue[idx]
+        self.populate_pdf_queue_model()
+
+    def on_clear_pdf_queue(self, widget):
+        self.pdf_queue.clear()
+        self.populate_pdf_queue_model()
+
+    def on_queue_item_selected(self, widget):
+        selection = self.pdf_queue_tree.get_selection()
+        model, treeiter = selection.get_selected()
+        if not treeiter:
+            return
+        idx = model.get_value(treeiter, 3)
+        path = self.pdf_queue[idx]["path"]
+        try:
+            self.current_pdf_doc = fitz.open(path)
+            self.page_spin.set_range(0, len(self.current_pdf_doc) - 1)
+            self.page_spin.set_value(0)
+            self.current_pdf_page = 0
+            self.update_pdf_preview()
+        except Exception:
+            pass
+
+    def on_print_pdf_queue_clicked(self, widget):
+        if not self.pdf_queue:
+            self.show_error_dialog("The PDF print queue is empty.")
+            return
+            
+        mode = self.conn_combo.get_active_id()
+        w_id = self.width_combo.get_active_id()
+        tw = int(w_id) if w_id else 832
+        
+        jobs = []
+        for item in self.pdf_queue:
+            jobs.append({
+                "path": item["path"],
+                "range": item["range"],
+                "item": item
+            })
+            
+        self.status_label.set_text("Printing PDF queue...")
+        
+        def run_queue_print():
+            for job in jobs:
+                q_item = job["item"]
+                GLib.idle_add(self.update_pdf_status_in_loop, q_item, "Printing...")
+                try:
+                    doc = fitz.open(job["path"])
+                    pages = []
+                    r_str = job["range"].strip().lower()
+                    if r_str == "all":
+                        pages = list(range(len(doc)))
+                    elif "-" in r_str:
+                        parts = r_str.split("-")
+                        pages = list(range(int(parts[0]), min(int(parts[1]) + 1, len(doc))))
+                    else:
+                        parts = r_str.split(",")
+                        for p in parts:
+                            if p.strip().isdigit():
+                                pages.append(int(p.strip()))
+                                
+                    items = []
+                    for p_num in pages:
+                        if p_num < len(doc):
+                            page = doc.load_page(p_num)
+                            pix = page.get_pixmap(dpi=200)
+                            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                            items.append({"type": "image", "image": img, "invert": self.pdf_invert})
+                            
+                    if not items:
+                        GLib.idle_add(self.update_pdf_status_in_loop, q_item, "Empty range")
+                        continue
+                        
+                    data = escpos_gen.compile_receipt(items, tw, self.chars_per_line, self.left_margin)
+                    if self.autocut_chk.get_active():
+                        data += b'\x1D\x56\x42\x00'
+                        
+                    if mode == "usb":
+                        path = self.dev_path_entry.get_text()
+                        success, err = printer_comm.write_to_printer(path, data)
+                    else:
+                        ip = self.ip_entry.get_text()
+                        try:
+                            status_port = int(self.status_port_spin.get_value())
+                            print_port = int(self.print_port_spin.get_value())
+                        except Exception:
+                            status_port = 4000
+                            print_port = 9100
+                        success, err = printer_comm.print_with_status_check(ip, data, status_port, print_port)
+                        
+                    if success:
+                        GLib.idle_add(self.update_pdf_status_in_loop, q_item, "Printed")
+                    else:
+                        GLib.idle_add(self.update_pdf_status_in_loop, q_item, f"Error: {err}")
+                        GLib.idle_add(self.show_error_dialog_from_thread, f"PDF printing failed: {err}")
+                        break
+                except Exception as e:
+                    GLib.idle_add(self.update_pdf_status_in_loop, q_item, f"Failed: {e}")
+                    GLib.idle_add(self.show_error_dialog_from_thread, f"PDF load exception: {e}")
+                    break
+            GLib.idle_add(self.status_label.set_text, "Queue finished")
+            
+        threading.Thread(target=run_queue_print, daemon=True).start()
+
+    def update_pdf_status_in_loop(self, q_item, status):
+        q_item["status"] = status
+        self.populate_pdf_queue_model()
+
+    def show_error_dialog_from_thread(self, text):
+        self.show_error_dialog(text)
 
     def on_pdf_selected(self, widget):
         path = widget.get_filename()
@@ -451,6 +1219,8 @@ class GPrinterApp(Gtk.Window):
                 {"type": "feed", "lines": 4}
             ]
             data = escpos_gen.compile_receipt(items, tw, self.chars_per_line, self.left_margin)
+            if self.autocut_chk.get_active():
+                data += b'\x1D\x56\x42\x00'
             self.send_to_printer(data)
         except Exception as e:
             self.show_error_dialog(f"PDF print failed: {e}")
@@ -487,25 +1257,47 @@ class GPrinterApp(Gtk.Window):
         printers = printer_comm.detect_printers()
         if printers:
             self.dev_path_entry.set_text(printers[0])
-            self.status_label.set_text(f"Detected: {printers[0]}")
+            self.status_label.set_markup(f"<span foreground='#2e7d32' weight='bold'>Detected: {printers[0]}</span>")
         else:
-            self.status_label.set_text("No USB printer detected")
+            self.status_label.set_markup("<span foreground='#c62828' weight='bold'>No USB printer detected</span>")
             self.show_error_dialog("No GPrinter USB printer detected.")
 
     def on_test_clicked(self, widget):
-        path = self.dev_path_entry.get_text()
         test_bytes = escpos_gen.ESC_INIT + escpos_gen.ALIGN_CENTER + b"Connection Test OK\n" + escpos_gen.get_feed_command(4)
+        if self.autocut_chk.get_active():
+            test_bytes += b'\x1D\x56\x42\x00'
         self.send_to_printer(test_bytes)
 
     def send_to_printer(self, data):
-        path = self.dev_path_entry.get_text()
-        self.status_label.set_text("Printing...")
-        success, err = printer_comm.write_to_printer(path, data)
-        if success:
-            self.status_label.set_text("Print succeeded")
+        mode = self.conn_combo.get_active_id()
+        if mode == "usb":
+            path = self.dev_path_entry.get_text()
+            self.status_label.set_text("Printing USB...")
+            success, err = printer_comm.write_to_printer(path, data)
+            if success:
+                self.status_label.set_text("Print succeeded")
+            else:
+                self.status_label.set_text("Print failed")
+                self.show_error_dialog(f"Printing failed: {err}")
         else:
-            self.status_label.set_text("Print failed")
-            self.show_error_dialog(f"Printing failed: {err}")
+            ip = self.ip_entry.get_text()
+            try:
+                status_port = int(self.status_port_spin.get_value())
+                print_port = int(self.print_port_spin.get_value())
+            except Exception:
+                status_port = 4000
+                print_port = 9100
+                
+            self.status_label.set_text("Printing Ethernet...")
+            
+            def run_send():
+                success, err = printer_comm.print_with_status_check(ip, data, status_port, print_port)
+                if success:
+                    GLib.idle_add(self.status_label.set_markup, "<span foreground='#2e7d32' weight='bold'>Print Succeeded</span>")
+                else:
+                    GLib.idle_add(self.status_label.set_markup, "<span foreground='#c62828' weight='bold'>Print Failed</span>")
+                    GLib.idle_add(self.show_error_dialog_from_thread, f"Printing failed: {err}")
+            threading.Thread(target=run_send, daemon=True).start()
 
     def show_error_dialog(self, message):
         dialog = Gtk.MessageDialog(
@@ -525,12 +1317,18 @@ class GPrinterApp(Gtk.Window):
         tw = int(w_id) if w_id else 832
         
         if page == 0:
-            data = escpos_gen.compile_receipt(self.receipt_items, tw, self.chars_per_line, self.left_margin)
-            self.send_to_printer(data)
+            self.on_print_order_clicked(None)
         elif page == 1:
-            data = tspl_gen.compile_label(self.label_width_mm, self.label_height_mm, self.label_gap_mm, self.label_elements)
+            data = escpos_gen.compile_receipt(self.receipt_items, tw, self.chars_per_line, self.left_margin)
+            if self.autocut_chk.get_active():
+                data += b'\x1D\x56\x42\x00'
             self.send_to_printer(data)
         elif page == 2:
+            data = tspl_gen.compile_label(self.label_width_mm, self.label_height_mm, self.label_gap_mm, self.label_elements)
+            if self.autocut_chk.get_active():
+                data += b"CUT\r\n"
+            self.send_to_printer(data)
+        elif page == 3:
             self.on_pdf_print_clicked(None)
 
     def run_receipt_text_dialog(self, item=None):
@@ -1062,6 +1860,18 @@ class GPrinterApp(Gtk.Window):
                 self.label_tree.scroll_to_cell(path, None, False, 0.0, 0.0)
                 break
             treeiter = self.label_model.iter_next(treeiter)
+
+    def show_info_dialog(self, message):
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="Information"
+        )
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
 
 if __name__ == "__main__":
     win = GPrinterApp()
