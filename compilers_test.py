@@ -92,5 +92,51 @@ class TestCompilers(unittest.TestCase):
         bar_els = [e for e in parsed_els if e["type"] == "barcode"]
         self.assertEqual(bar_els[0]["content"], "123456")
 
+    def test_get_cups_printers(self):
+        from unittest.mock import patch, MagicMock
+        with patch('subprocess.run') as mock_run:
+            mock_res = MagicMock()
+            mock_res.returncode = 0
+            mock_res.stdout = "printer p1 is idle. enabled since...\nprinter p2 is idle. enabled since..."
+            mock_run.return_value = mock_res
+            import printer_comm
+            printers = printer_comm.get_cups_printers()
+            self.assertEqual(printers, ["p1", "p2"])
+
+    def test_get_default_cups_printer(self):
+        from unittest.mock import patch, MagicMock
+        with patch('subprocess.run') as mock_run:
+            mock_res = MagicMock()
+            mock_res.returncode = 0
+            mock_res.stdout = "system default destination: p1\n"
+            mock_run.return_value = mock_res
+            import printer_comm
+            self.assertEqual(printer_comm.get_default_cups_printer(), "p1")
+
+    def test_query_cups_status(self):
+        from unittest.mock import patch, MagicMock
+        with patch('subprocess.run') as mock_run:
+            mock_res = MagicMock()
+            mock_res.returncode = 0
+            mock_res.stdout = "printer p1 is idle. enabled since..."
+            mock_run.return_value = mock_res
+            import printer_comm
+            status = printer_comm.query_cups_status("p1")
+            self.assertTrue(status["success"])
+            self.assertTrue(status["online"])
+            self.assertEqual(status["error_msg"], "Ready")
+
+    def test_print_via_cups(self):
+        from unittest.mock import patch, MagicMock
+        with patch('subprocess.Popen') as mock_popen:
+            mock_proc = MagicMock()
+            mock_proc.communicate.return_value = (b"", b"")
+            mock_proc.returncode = 0
+            mock_popen.return_value = mock_proc
+            import printer_comm
+            success, err = printer_comm.print_via_cups("p1", b"data")
+            self.assertTrue(success)
+            self.assertIsNone(err)
+
 if __name__ == "__main__":
     unittest.main()

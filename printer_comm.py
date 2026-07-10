@@ -221,3 +221,74 @@ def print_with_status_check(ip, data, status_port=4000, print_port=9100):
             return False, f"Printing Anomaly: {', '.join(anomaly_msg)}"
             
     return True, None
+
+def get_cups_printers():
+    try:
+        res = subprocess.run(["lpstat", "-p"], capture_output=True, text=True)
+        if res.returncode != 0:
+            return []
+        printers = []
+        for line in res.stdout.splitlines():
+            if line.startswith("printer "):
+                parts = line.split()
+                if len(parts) >= 2:
+                    printers.append(parts[1])
+        return sorted(printers)
+    except Exception:
+        return []
+
+def get_default_cups_printer():
+    try:
+        res = subprocess.run(["lpstat", "-d"], capture_output=True, text=True)
+        if res.returncode == 0:
+            line = res.stdout.strip()
+            if ":" in line:
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+def query_cups_status(printer_name):
+    try:
+        res = subprocess.run(["lpstat", "-p", printer_name], capture_output=True, text=True)
+        if res.returncode == 0:
+            output = res.stdout.strip()
+            enabled = "enabled" in output
+            status_text = "Ready" if enabled else "Disabled/Offline"
+            if "disabled" in output:
+                parts = output.split(" - ")
+                if len(parts) > 1:
+                    status_text = f"Disabled: {parts[1].strip()}"
+            return {
+                "success": True,
+                "online": enabled,
+                "error_msg": "Ready" if enabled else status_text
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "online": False,
+            "error_msg": str(e)
+        }
+    return {
+        "success": False,
+        "online": False,
+        "error_msg": "Unknown error"
+    }
+
+def print_via_cups(printer_name, data):
+    try:
+        process = subprocess.Popen(
+            ["lp", "-d", printer_name, "-o", "raw", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = process.communicate(input=data)
+        if process.returncode == 0:
+            return True, None
+        err_msg = stderr.decode('utf-8', errors='replace').strip()
+        return False, Exception(f"lp failed with code {process.returncode}: {err_msg}")
+    except Exception as e:
+        return False, e
+

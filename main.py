@@ -170,6 +170,7 @@ class GPrinterApp(Gtk.Window):
         self.conn_combo = Gtk.ComboBoxText()
         self.conn_combo.append("usb", "USB (/dev/usb/lp*)")
         self.conn_combo.append("ethernet", "Ethernet (LAN)")
+        self.conn_combo.append("cups", "CUPS (System Printers)")
         self.conn_combo.set_active_id("usb")
         self.conn_combo.connect("changed", self.on_conn_mode_changed)
         conn_grid.attach(self.conn_combo, 1, 0, 1, 1)
@@ -206,6 +207,15 @@ class GPrinterApp(Gtk.Window):
         self.discovered_combo.connect("changed", self.on_discovered_changed)
         conn_grid.attach(self.discovered_combo, 1, 6, 1, 1)
         
+        self.cups_lbl = Gtk.Label(label="CUPS Printer:")
+        conn_grid.attach(self.cups_lbl, 0, 8, 1, 1)
+        self.cups_combo = Gtk.ComboBoxText()
+        conn_grid.attach(self.cups_combo, 1, 8, 1, 1)
+        
+        self.cups_refresh_btn = Gtk.Button(label="Refresh CUPS List")
+        self.cups_refresh_btn.connect("clicked", self.on_refresh_cups_clicked)
+        conn_grid.attach(self.cups_refresh_btn, 1, 9, 1, 1)
+        
         test_btn = Gtk.Button(label="Test Connection")
         test_btn.connect("clicked", self.on_test_clicked)
         conn_grid.attach(test_btn, 0, 7, 2, 1)
@@ -219,7 +229,7 @@ class GPrinterApp(Gtk.Window):
         config_grid.attach(Gtk.Label(label="Density/Width:"), 0, 0, 1, 1)
         self.width_combo = Gtk.ComboBoxText()
         self.width_combo.append("384", "2 inch (384 dots)")
-        self.width_combo.append("576", "3 inch (576 dots)")
+        self.width_combo.append("576", "80mm / 3.14 inch (576 dots)")
         self.width_combo.append("832", "4 inch (832 dots)")
         self.width_combo.set_active_id("832")
         self.width_combo.connect("changed", self.on_width_changed)
@@ -256,18 +266,42 @@ class GPrinterApp(Gtk.Window):
     def on_conn_mode_changed(self, widget):
         mode = widget.get_active_id()
         is_usb = (mode == "usb")
+        is_ethernet = (mode == "ethernet")
+        is_cups = (mode == "cups")
         
         self.usb_lbl.set_visible(is_usb)
         self.dev_path_entry.set_visible(is_usb)
         self.usb_detect_btn.set_visible(is_usb)
-        self.ip_lbl.set_visible(not is_usb)
-        self.ip_entry.set_visible(not is_usb)
-        self.print_port_lbl.set_visible(not is_usb)
-        self.print_port_spin.set_visible(not is_usb)
-        self.status_port_lbl.set_visible(not is_usb)
-        self.status_port_spin.set_visible(not is_usb)
-        self.scan_lan_btn.set_visible(not is_usb)
-        self.discovered_combo.set_visible(not is_usb)
+        
+        self.ip_lbl.set_visible(is_ethernet)
+        self.ip_entry.set_visible(is_ethernet)
+        self.print_port_lbl.set_visible(is_ethernet)
+        self.print_port_spin.set_visible(is_ethernet)
+        self.status_port_lbl.set_visible(is_ethernet)
+        self.status_port_spin.set_visible(is_ethernet)
+        self.scan_lan_btn.set_visible(is_ethernet)
+        self.discovered_combo.set_visible(is_ethernet)
+        
+        self.cups_lbl.set_visible(is_cups)
+        self.cups_combo.set_visible(is_cups)
+        self.cups_refresh_btn.set_visible(is_cups)
+        
+        if is_cups:
+            self.refresh_cups_list()
+
+    def refresh_cups_list(self):
+        self.cups_combo.remove_all()
+        printers = printer_comm.get_cups_printers()
+        default = printer_comm.get_default_cups_printer()
+        for p in printers:
+            self.cups_combo.append(p, p)
+        if default and default in printers:
+            self.cups_combo.set_active_id(default)
+        elif printers:
+            self.cups_combo.set_active(0)
+
+    def on_refresh_cups_clicked(self, widget):
+        self.refresh_cups_list()
 
     def start_status_polling(self):
         GLib.timeout_add(1500, self.poll_printer_status)
@@ -283,6 +317,17 @@ class GPrinterApp(Gtk.Window):
                 self.status_label.set_markup("<span foreground='#2e7d32' weight='bold'>Connected (USB)</span>")
             else:
                 self.status_label.set_markup("<span foreground='#c62828' weight='bold'>Disconnected (USB)</span>")
+        elif mode == "cups":
+            printer_name = self.cups_combo.get_active_id()
+            if not printer_name:
+                self.status_label.set_markup("<span foreground='#c62828' weight='bold'>No CUPS printer</span>")
+                return True
+                
+            def run_query():
+                status = printer_comm.query_cups_status(printer_name)
+                GLib.idle_add(self.update_cups_status_ui, status, printer_name)
+                
+            threading.Thread(target=run_query, daemon=True).start()
         else:
             ip = self.ip_entry.get_text()
             try:
@@ -297,6 +342,13 @@ class GPrinterApp(Gtk.Window):
             threading.Thread(target=run_query, daemon=True).start()
             
         return True
+
+    def update_cups_status_ui(self, status, printer_name):
+        if not status["success"] or not status["online"]:
+            self.status_label.set_markup(f"<span foreground='#c62828' weight='bold'>CUPS Offline ({printer_name}): {status['error_msg']}</span>")
+        else:
+            self.status_label.set_markup(f"<span foreground='#2e7d32' weight='bold'>CUPS Ready ({printer_name})</span>")
+
 
     def update_ethernet_status_ui(self, status):
         if not status["success"]:
@@ -600,6 +652,19 @@ class GPrinterApp(Gtk.Window):
                 order["status"] = "Error"
                 self.populate_order_model()
                 self.show_error_dialog(f"Printing failed: {err}")
+        elif mode == "cups":
+            printer_name = self.cups_combo.get_active_id()
+            if not printer_name:
+                self.show_error_dialog("No CUPS printer selected.")
+                return
+            self.status_label.set_text("Printing order via CUPS...")
+            def run_print():
+                success, err = printer_comm.print_via_cups(printer_name, data)
+                if success:
+                    GLib.idle_add(self.order_print_completed, order, idx, True, None)
+                else:
+                    GLib.idle_add(self.order_print_completed, order, idx, False, err)
+            threading.Thread(target=run_print, daemon=True).start()
         else:
             ip = self.ip_entry.get_text()
             try:
@@ -1083,6 +1148,7 @@ class GPrinterApp(Gtk.Window):
             return
             
         mode = self.conn_combo.get_active_id()
+        cups_printer = self.cups_combo.get_active_id() if mode == "cups" else None
         w_id = self.width_combo.get_active_id()
         tw = int(w_id) if w_id else 832
         
@@ -1134,6 +1200,11 @@ class GPrinterApp(Gtk.Window):
                     if mode == "usb":
                         path = self.dev_path_entry.get_text()
                         success, err = printer_comm.write_to_printer(path, data)
+                    elif mode == "cups":
+                        if not cups_printer:
+                            success, err = False, "No CUPS printer selected"
+                        else:
+                            success, err = printer_comm.print_via_cups(cups_printer, data)
                     else:
                         ip = self.ip_entry.get_text()
                         try:
@@ -1279,6 +1350,20 @@ class GPrinterApp(Gtk.Window):
             else:
                 self.status_label.set_text("Print failed")
                 self.show_error_dialog(f"Printing failed: {err}")
+        elif mode == "cups":
+            printer_name = self.cups_combo.get_active_id()
+            if not printer_name:
+                self.show_error_dialog("No CUPS printer selected.")
+                return
+            self.status_label.set_text("Printing CUPS...")
+            def run_send():
+                success, err = printer_comm.print_via_cups(printer_name, data)
+                if success:
+                    GLib.idle_add(self.status_label.set_markup, "<span foreground='#2e7d32' weight='bold'>Print Succeeded</span>")
+                else:
+                    GLib.idle_add(self.status_label.set_markup, "<span foreground='#c62828' weight='bold'>Print Failed</span>")
+                    GLib.idle_add(self.show_error_dialog_from_thread, f"Printing failed: {err}")
+            threading.Thread(target=run_send, daemon=True).start()
         else:
             ip = self.ip_entry.get_text()
             try:
